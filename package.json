@@ -1,0 +1,22 @@
+{
+  "name": "verta-magpie-auth",
+  "version": "5.0.0",
+  "description": "Vetra / NextOra provider plugin for magpie: native API keys, ADFS browser sign-in, automatic renewal, and OpenAI & Anthropic local tool calls",
+  "type": "module",
+  "main": "./index.mjs",
+  "scripts": {
+    "test": "node auth.test.mjs && node api-key.test.mjs && node scanner.test.mjs && node bridge.test.mjs && node thread.test.mjs"
+  },
+  "files": [
+    "index.mjs",
+    "README.md"
+  ],
+  "keywords": [
+    "magpie",
+    "verta",
+    "vetra",
+    "nextora"
+  ],
+  "author": "MaMy",
+  "license": "MIT"
+}
