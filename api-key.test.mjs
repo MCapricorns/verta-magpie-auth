@@ -62,6 +62,7 @@ test("API key sign-in lists the account's native model IDs and endpoint", async 
   const usage = await plugin.auth.usage(async () => auth)
   assert.equal(usage.plan, "Vetra api-key")
   assert.deepEqual(usage.windows, [])
+  assert.equal(await plugin.auth.refresh(auth), auth)
 })
 
 test("native chat keeps tools and history while adapting the gateway's GPT-5 parameters", async (t) => {

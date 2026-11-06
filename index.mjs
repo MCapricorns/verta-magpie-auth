@@ -313,8 +313,16 @@ function parseToken(raw) {
   return { token, itcode, claims, exp: Number.isFinite(exp) ? exp : 0, expired }
 }
 
-function resolveCredentials(auth) {
+const renewedCredentials = new Map()
+
+function renewalScope(base) {
+  return profileDir() + "\0" + base.replace(/\/+$/, "")
+}
+
+function resolveCredentials(auth, base = DEFAULT_BASE) {
   const candidate = String(auth?.access || auth?.key || "").trim()
+  const cached = renewedCredentials.get(renewalScope(base))
+  if (cached?.previousTokens.has(candidate) && !parseToken(cached.creds.token).expired) return cached.creds
   if (candidate) return parseToken(candidate)
   return { token: "", itcode: "", claims: {}, exp: 0, expired: true }
 }
@@ -575,9 +583,31 @@ async function settle(child, port, timeoutMs) {
   }
 }
 
-// Use the persisted Edge/Chrome profile for ADFS. Keep the window visible
-// so password and MFA prompts can be completed in the same sign-in.
-async function openBrowserLogin(base = DEFAULT_BASE, previousToken = "") {
+// Close through CDP so Chromium flushes the profile, including after a
+// launcher handoff. Only callers that own the session may close it.
+async function closeBrowser(port, profile) {
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/json/version`, { signal: AbortSignal.timeout(1500) })
+    if (!response.ok) return false
+    const version = await response.json()
+    if (!version.webSocketDebuggerUrl) return false
+    await cdpCall(version.webSocketDebuggerUrl, "Browser.close", {}).catch(() => null)
+    const deadline = Date.now() + 5000
+    while (Date.now() < deadline && await cdpAnswers(port)) {
+      await new Promise((resolve) => setTimeout(resolve, 300))
+    }
+    if (await cdpAnswers(port)) return false
+    if (markedPort(profile) === port) {
+      try { unlinkSync(portMarker(profile)) } catch {}
+      try { unlinkSync(join(profile, "cdp-mode")) } catch {}
+    }
+    return true
+  } catch { return false }
+}
+
+// Background renewal must never open or focus a window. Explicit sign-in
+// keeps password and MFA prompts visible in the persisted profile.
+async function openBrowserLogin(base = DEFAULT_BASE, previousToken = "", { background = false, resumeOnly = false } = {}) {
   const browser = findBrowser()
   if (!browser) {
     throw new Error("未找到 Edge 或 Chrome，请设置 VETRA_BROWSER")
@@ -602,36 +632,56 @@ async function openBrowserLogin(base = DEFAULT_BASE, previousToken = "") {
       "--no-default-browser-check",
       "--auth-server-whitelist=*.lenovo.com",
       "--auth-negotiate-delegate-whitelist=*.lenovo.com",
-      "--new-window",
+      ...(background ? ["--headless=new"] : ["--new-window"]),
       home,
     ]
     // detached: the window must outlive the plugin host, which magpie restarts
     // between a sign-in's steps; the marker lets the next call find it again.
     const child = spawn(browser, args, { stdio: "ignore", detached: true })
     child.unref()
-    try { writeFileSync(portMarker(profile), String(port)) } catch {}
+    try {
+      writeFileSync(portMarker(profile), String(port))
+      writeFileSync(join(profile, "cdp-mode"), background ? "headless" : "visible")
+    } catch {}
     return child
   }
 
   let port = 0
   let child = null
   const marked = markedPort(profile)
-  const live = marked > 0 && (await cdpAnswers(marked))
+  let live = marked > 0 && (await cdpAnswers(marked))
+  let headless = false
+  try { headless = readFileSync(join(profile, "cdp-mode"), "utf8") === "headless" } catch {}
+  if (live && headless && !background) {
+    if (!(await closeBrowser(marked, profile))) {
+      throw new Error("后台登录浏览器尚未退出，请稍后重试网页登录")
+    }
+    live = false
+  }
   if (live) {
     // Keep the current sign-in page, including any password or MFA in progress.
     port = marked
   } else {
     port = marked || await freePort()
     child = launch(port)
-    const state = await settle(child, port, 30_000)
-    if (state === "silent") {
-      throw new Error("登录窗口已保留，但 30 秒内无法连接本机调试端口。请检查 Edge/Chrome 的 RemoteDebuggingAllowed 策略及本机安全软件，处理后重试")
-    }
-    if (state === "exited") {
-      throw new Error("登录浏览器已退出，或该专用 profile 已被其它窗口占用。请关闭使用该 profile 的旧登录窗口后重试，或用 VETRA_BROWSER 指定浏览器")
+    try {
+      const state = await settle(child, port, 30_000)
+      if (state === "silent") {
+        throw new Error(background
+          ? "Vetra 静默续期无法连接浏览器调试端口，请检查 Edge/Chrome 的 RemoteDebuggingAllowed 策略及本机安全软件后手动登录"
+          : "登录窗口已保留，但 30 秒内无法连接本机调试端口。请检查 Edge/Chrome 的 RemoteDebuggingAllowed 策略及本机安全软件，处理后重试")
+      }
+      if (state === "exited") {
+        throw new Error("登录浏览器已退出，或该专用 profile 已被其它窗口占用。请关闭使用该 profile 的旧登录窗口后重试，或用 VETRA_BROWSER 指定浏览器")
+      }
+    } catch (error) {
+      if (background && !(await closeBrowser(port, profile)) && child.exitCode === null && child.signalCode === null) {
+        child.kill("SIGTERM")
+      }
+      throw error
     }
   }
-  await ensureVisibleWindow(port)
+  if (!background) await ensureVisibleWindow(port)
   let exited = false
   const watch = (c) => {
     if (!c) return
@@ -641,21 +691,8 @@ async function openBrowserLogin(base = DEFAULT_BASE, previousToken = "") {
   watch(child)
 
   const close = async () => {
-    if (!child || child.exitCode !== null || child.signalCode !== null) return
-    // Let Chromium flush the SSO cookies and local storage before it exits.
-    // A failed close leaves the window available for the next login attempt.
-    try {
-      const version = await (await fetch("http://127.0.0.1:" + port + "/json/version", { signal: AbortSignal.timeout(1500) })).json()
-      if (!version.webSocketDebuggerUrl) return
-      await cdpCall(version.webSocketDebuggerUrl, "Browser.close", {}).catch(() => null)
-      const deadline = Date.now() + 5000
-      while (Date.now() < deadline && await cdpAnswers(port)) {
-        await new Promise((resolve) => setTimeout(resolve, 300))
-      }
-      if (!(await cdpAnswers(port)) && markedPort(profile) === port) {
-        try { unlinkSync(portMarker(profile)) } catch {}
-      }
-    } catch {}
+    if (!child || (!background && (child.exitCode !== null || child.signalCode !== null))) return
+    await closeBrowser(port, profile)
   }
 
   const waitForToken = async (timeoutMs = 10 * 60_000) => {
@@ -672,7 +709,7 @@ async function openBrowserLogin(base = DEFAULT_BASE, previousToken = "") {
           const loginPending = pages.some(t => t?.type === "page" && /\/adfs\/ls(?:\/|\?|$)/i.test(t.url ?? ""))
           for (const t of pages) {
             if (t?.type !== "page" || !t.webSocketDebuggerUrl || !t.url) continue
-            if (!switchedToForms && /\/adfs\/ls\/wia(?:\?|$)/i.test(t.url)) {
+            if (!resumeOnly && !switchedToForms && /\/adfs\/ls\/wia(?:\?|$)/i.test(t.url)) {
               const href = await cdpEval(t.webSocketDebuggerUrl, "location.href").catch(() => "")
               if (typeof href === "string" && href.startsWith("chrome-error://")) {
                 switchedToForms = true
@@ -698,7 +735,7 @@ async function openBrowserLogin(base = DEFAULT_BASE, previousToken = "") {
             // Preserve an ADFS/password/MFA page already in progress.
             const pagePath = new URL(t.url).pathname.replace(/\/+$/, "")
             const appPage = pagePath === appPath || pagePath === appPath + "/workspace" || pagePath.startsWith(appPath + "/workspace/")
-            if (!startedRenewal && !loginPending && appPage && (creds?.expired || previousToken)) {
+            if (!resumeOnly && !startedRenewal && !loginPending && appPage && (creds?.expired || previousToken)) {
               startedRenewal = true
               if (creds?.expired) {
                 await cdpEval(t.webSocketDebuggerUrl, `localStorage.removeItem(${JSON.stringify(TOKEN_KEY)})`).catch(() => null)
@@ -708,22 +745,26 @@ async function openBrowserLogin(base = DEFAULT_BASE, previousToken = "") {
           }
         }
       } catch {}
+      if (resumeOnly) break
       await new Promise((r) => setTimeout(r, 750))
     }
     if (!(await cdpAnswers(port))) throw new Error("登录窗口已关闭，请重新点击登录")
+    if (background) throw new Error("Vetra 静默续期未完成，请手动选择网页登录完成密码或验证码验证")
     throw new Error("登录等待超时，浏览器窗口已保留。请在原窗口完成登录后重试")
   }
 
   return { waitForToken, close }
 }
 
-let renewing = null
+const renewing = new Map()
 
-async function signInWithBrowser(base, timeoutMs, previousToken) {
-  const session = await openBrowserLogin(base, previousToken)
-  const creds = await session.waitForToken(timeoutMs)
-  await session.close()
-  return creds
+async function signInWithBrowser(base, timeoutMs, previousToken, resumeOnly) {
+  const session = await openBrowserLogin(base, previousToken, { background: true, resumeOnly })
+  try {
+    return await session.waitForToken(timeoutMs)
+  } finally {
+    await session.close()
+  }
 }
 
 function successOf(creds) {
@@ -736,33 +777,47 @@ function successOf(creds) {
   }
 }
 
-// One renewal runs at a time because every request shares the browser profile.
-// Keep the same visible window for password or MFA, and back off after failure.
+// Share renewal results across model, usage and request callbacks. The host
+// may keep returning the old token until its own refresh callback persists it.
 async function renewCredentials(base = DEFAULT_BASE, previousToken = "") {
-  if (renewing) return renewing
-  renewing = (async () => {
+  if (!previousToken) {
+    throw Object.assign(new Error("未找到 Vetra 登录凭证，请先手动登录"), { signIn: "expired" })
+  }
+  const scope = renewalScope(base)
+  const cached = renewedCredentials.get(scope)
+  if (cached?.previousTokens.has(previousToken) && !parseToken(cached.creds.token).expired) return cached.creds
+  if (renewing.has(scope)) return renewing.get(scope)
+  const pending = (async () => {
     const profile = profileDir()
     const retryFile = join(profile, "renewal-retry-at")
     let retryAt = 0
     try { retryAt = Number(readFileSync(retryFile, "utf8")) || 0 } catch {}
     const port = markedPort(profile)
-    // A live login may have completed while the caller was away. Resume it
-    // during backoff, but do not launch another browser after a host restart.
-    if (Date.now() < retryAt && !(port && await cdpAnswers(port))) {
+    // A manual login may have completed during backoff. Read its existing
+    // window without opening or focusing one, including after a host restart.
+    const resumeOnly = Date.now() < retryAt
+    if (resumeOnly && !(port && await cdpAnswers(port))) {
       throw Object.assign(new Error("Vetra 登录续期暂未完成，请稍后重试；手动登录可立即重试"), { signIn: "kept" })
     }
     try {
-      return await signInWithBrowser(base, 180_000, previousToken)
+      const creds = await signInWithBrowser(base, 30_000, previousToken, resumeOnly)
+      const previousTokens = new Set(cached?.creds.token === previousToken ? cached.previousTokens : [])
+      previousTokens.add(previousToken)
+      renewedCredentials.set(scope, { previousTokens, creds })
+      return creds
     } catch (error) {
-      try {
-        mkdirSync(profile, { recursive: true, mode: 0o700 })
-        writeFileSync(retryFile, String(Date.now() + 10 * 60_000), { mode: 0o600 })
-      } catch {}
+      if (!resumeOnly) {
+        try {
+          mkdirSync(profile, { recursive: true, mode: 0o700 })
+          writeFileSync(retryFile, String(Date.now() + 10 * 60_000), { mode: 0o600 })
+        } catch {}
+      }
       error.signIn = "kept"
       throw error
     }
-  })().finally(() => { renewing = null })
-  return renewing
+  })().finally(() => { renewing.delete(scope) })
+  renewing.set(scope, pending)
+  return pending
 }
 
 // ---- prompt & tool call bridging -----------------------------------------
@@ -1513,7 +1568,7 @@ export async function VetraAuthPlugin(_input = {}, options = {}) {
           }))
         }
         let creds
-        try { creds = resolveCredentials(auth) } catch { return provider?.models ?? {} }
+        try { creds = resolveCredentials(auth, base) } catch { return provider?.models ?? {} }
         if (creds.expired) {
           try { creds = await renewCredentials(base, creds.token) } catch { return provider?.models ?? {} }
         }
@@ -1546,10 +1601,11 @@ export async function VetraAuthPlugin(_input = {}, options = {}) {
     auth: {
       provider: ID,
       // The session JWT returned after ADFS sign-in has no refresh-token grant.
-      // Renew through the persisted browser profile so the ADFS session and
-      // Windows authentication can complete the next sign-in.
+      // Renew silently through the persisted profile. Password or MFA prompts
+      // require explicit sign-in instead of interrupting background polling.
       refreshLead: 60 * 60_000,
       refresh: async (auth) => {
+        if (auth?.type === "api") return auth
         const creds = await renewCredentials(base, auth?.access)
         return { access: creds.token, expires: creds.exp ? creds.exp * 1000 : 0, accountId: creds.itcode || "Vetra" }
       },
@@ -1558,11 +1614,12 @@ export async function VetraAuthPlugin(_input = {}, options = {}) {
           type: "oauth",
           label: "网页登录",
           authorize: async () => {
-            // Show the current login window for an explicit sign-in.
+            // Let an owned headless session flush and exit before opening UI.
+            await renewing.get(renewalScope(base))?.catch(() => null)
             const session = await openBrowserLogin(base)
             return {
               url: "",
-              instructions: "在弹出的网页中完成登录，即可完成绑定。到期后会自动尝试续期；需要输入密码或验证码时，请在原窗口继续操作。",
+              instructions: "在弹出的网页中完成登录，即可完成绑定。到期后会静默尝试续期；需要密码或验证码时，请手动选择网页登录。",
               method: "auto",
               opened: true,
               callback: async () => {
@@ -1603,7 +1660,7 @@ export async function VetraAuthPlugin(_input = {}, options = {}) {
         }
         let creds
         try {
-          creds = resolveCredentials(auth)
+          creds = resolveCredentials(auth, base)
         } catch (e) {
           return { error: String(e?.message ?? e), windows: [], signIn: "expired" }
         }
@@ -1668,7 +1725,7 @@ export async function VetraAuthPlugin(_input = {}, options = {}) {
 
             let creds
             try {
-              creds = resolveCredentials(await getAuth())
+              creds = resolveCredentials(await getAuth(), base)
               // A token this close to its end is renewed before it can fail
               // mid-answer; magpie renews too, this covers a direct fetch.
               if (creds.expired || (creds.exp > 0 && creds.exp - Date.now() / 1000 < 120)) {
