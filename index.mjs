@@ -556,8 +556,8 @@ async function ensureVisibleWindow(port) {
   } catch {}
 }
 
-// Check the debug endpoint before the launcher exit: Chromium can hand off to
-// an existing process while the profile and its window remain alive.
+// Chromium can hand off to another process before its debug port is ready.
+// Keep polling for the full startup window even after the launcher exits.
 async function settle(child, port, timeoutMs) {
   const deadline = Date.now() + timeoutMs
   let launchError
@@ -567,10 +567,9 @@ async function settle(child, port, timeoutMs) {
     while (Date.now() < deadline) {
       if (await cdpAnswers(port)) return "ready"
       if (launchError) throw launchError
-      if (child.exitCode !== null || child.signalCode !== null) return "exited"
       await new Promise((r) => setTimeout(r, 300))
     }
-    return "silent"
+    return child.exitCode !== null || child.signalCode !== null ? "exited" : "silent"
   } finally {
     child.off("error", onError)
   }

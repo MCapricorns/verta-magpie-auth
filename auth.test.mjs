@@ -131,9 +131,25 @@ test("an exited launcher cannot hide a live browser or end token polling", async
   assert.equal(existsSync(state.marker), true)
 })
 
+test("a launcher handoff waits for the debug port before completing sign-in", async (t) => {
+  const token = tokenFor(3600)
+  const state = fixture(t, { launcherExited: true, readyAt: 7200, token })
+  const plugin = await VetraAuthPlugin({}, { base: "https://vetra.test" })
+  const login = await plugin.auth.methods[0].authorize()
+  const result = await login.callback()
+  assert.equal(result.type, "success")
+  assert.equal(result.access, token)
+  assert.ok(state.now >= 7200 && state.now < 30_000)
+  assert.equal(state.children.length, 1)
+  assert.deepEqual(state.signals, [])
+  assert.equal(state.calls.some(call => call.method === "Browser.close"), false)
+  assert.ok(existsSync(state.marker))
+})
+
 test("a failed launcher is reported once without terminating profile browsers", async (t) => {
   const state = fixture(t, { readyAt: Infinity, launcherExited: true })
   await assert.rejects(_internal.openBrowserLogin("https://vetra.test"), /登录浏览器已退出/)
+  assert.ok(state.now >= 30_000 && state.now < 31_000)
   assert.equal(state.children.length, 1)
   assert.deepEqual(state.signals, [])
 })
